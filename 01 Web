@@ -1,1 +1,187 @@
+# Streamlit Meeting Agenda Viewer
+# Filename: app.py
+# How to use:
+# 1) Save this file as app.py and push to a GitHub repo (root or a folder).
+# 2) (Optional) Add a sample CSV to your repo and copy the raw GitHub URL.
+# 3) Deploy on Streamlit Community Cloud (https://share.streamlit.io) choosing this repo and the file path app.py
+#
+# Features:
+# - Load agenda from a GitHub raw CSV URL or upload a local CSV.
+# - Interactive table view of agenda items.
+# - Gantt-style timeline visualization using Altair.
+# - Form to add new agenda items in the session (not persisted to GitHub automatically).
+# - Download current agenda as CSV.
+#
+# CSV expected columns (header):
+# Start,End,Title,Speaker,Location,Notes
+# Date/time format example: 2025-10-04 09:00
+
+import streamlit as st
+import pandas as pd
+import altair as alt
+import io
+from datetime import datetime
+
+st.set_page_config(page_title="Agenda de Reunión", layout='wide')
+
+st.title("📋 Visualizador de Agenda de Reunión")
+st.write("Carga una agenda en CSV desde GitHub (raw) o súbela desde tu equipo. Añade items en la sesión y descarga el resultado.")
+
+# --- Sidebar: inputs ---
+st.sidebar.header("Fuente de la agenda")
+example_raw = "https://raw.githubusercontent.com/tu-usuario/tu-repo/main/agenda_sample.csv"
+raw_url = st.sidebar.text_input("URL raw de GitHub (CSV)", value="")
+uploaded_file = st.sidebar.file_uploader("O sube un CSV desde tu equipo", type=['csv'])
+
+# Helper: load CSV
+@st.cache_data
+def load_csv_from_url(url: str):
+    try:
+        df = pd.read_csv(url)
+        return df
+    except Exception as e:
+        st.sidebar.error(f"Error al leer la URL: {e}")
+        return None
+
+@st.cache_data
+def load_csv_bytes(bytes_io):
+    try:
+        df = pd.read_csv(bytes_io)
+        return df
+    except Exception as e:
+        st.sidebar.error(f"Error al leer el archivo: {e}")
+        return None
+
+# Determine source
+df = None
+if raw_url.strip():
+    df = load_csv_from_url(raw_url.strip())
+elif uploaded_file is not None:
+    df = load_csv_bytes(uploaded_file)
+else:
+    # Provide a default sample agenda
+    sample = [
+        {"Start": "2025-10-04 09:00", "End": "2025-10-04 09:15", "Title": "Bienvenida & Objetivos", "Speaker": "Host", "Location": "Sala A", "Notes": "Agenda y reglas rápidas"},
+        {"Start": "2025-10-04 09:15", "End": "2025-10-04 09:45", "Title": "Reporte de avance", "Speaker": "María", "Location": "Sala A", "Notes": "KPIs Q3"},
+        {"Start": "2025-10-04 09:45", "End": "2025-10-04 10:15", "Title": "Discusión: Roadmap", "Speaker": "Carlos", "Location": "Sala A", "Notes": "Prioridades"},
+        {"Start": "2025-10-04 10:15", "End": "2025-10-04 10:30", "Title": "Cierre", "Speaker": "Host", "Location": "Sala A", "Notes": "Próximos pasos"},
+    ]
+    df = pd.DataFrame(sample)
+
+# Normalize dataframe: ensure columns exist
+expected_cols = ["Start", "End", "Title", "Speaker", "Location", "Notes"]
+for c in expected_cols:
+    if c not in df.columns:
+        df[c] = ""
+
+# Parse datetimes
+def parse_datetime_columns(dframe: pd.DataFrame):
+    d = dframe.copy()
+    for col in ["Start","End"]:
+        try:
+            d[col] = pd.to_datetime(d[col])
+        except Exception:
+            # try common formats
+            d[col] = pd.to_datetime(d[col], errors='coerce')
+    return d
+
+df = parse_datetime_columns(df)
+
+# Put dataframe in session state for editing
+if 'agenda_df' not in st.session_state:
+    st.session_state['agenda_df'] = df.sort_values('Start').reset_index(drop=True)
+
+# --- Main layout ---
+col1, col2 = st.columns([1,1])
+
+with col1:
+    st.subheader("📅 Tabla de la Agenda")
+    st.write("Ordenada por inicio. Puedes filtrar por speaker o buscar textos.")
+
+    # Filters
+    speaker_list = [s for s in sorted(set(st.session_state['agenda_df']['Speaker'].dropna().astype(str))) if s]
+    speaker_filter = st.selectbox("Filtrar por speaker (opcional)", options=["-- Todos --"] + speaker_list)
+    search_text = st.text_input("Buscar en títulos/notes")
+
+    df_view = st.session_state['agenda_df'].copy()
+    if speaker_filter != "-- Todos --":
+        df_view = df_view[df_view['Speaker'] == speaker_filter]
+    if search_text.strip():
+        mask = df_view['Title'].str.contains(search_text, case=False, na=False) | df_view['Notes'].str.contains(search_text, case=False, na=False)
+        df_view = df_view[mask]
+
+    st.dataframe(df_view[['Start','End','Title','Speaker','Location','Notes']].sort_values('Start').reset_index(drop=True), height=400)
+
+    # Download current agenda
+    def convert_df_to_csv_bytes(dframe: pd.DataFrame):
+        return dframe.to_csv(index=False).encode('utf-8')
+
+    csv_bytes = convert_df_to_csv_bytes(st.session_state['agenda_df'])
+    st.download_button("⬇️ Descargar agenda (CSV)", data=csv_bytes, file_name='agenda.csv', mime='text/csv')
+
+    st.markdown("---")
+    st.subheader("➕ Añadir item (temporal en la sesión)")
+    with st.form(key='add_item'):
+        t_start = st.text_input('Inicio (YYYY-MM-DD HH:MM)', value='2025-10-04 10:30')
+        t_end = st.text_input('Fin (YYYY-MM-DD HH:MM)', value='2025-10-04 11:00')
+        t_title = st.text_input('Título', value='Nuevo punto')
+        t_speaker = st.text_input('Speaker', value='')
+        t_location = st.text_input('Location', value='')
+        t_notes = st.text_area('Notas', value='')
+        submit = st.form_submit_button('Añadir a la agenda (solo sesión)')
+        if submit:
+            try:
+                new_row = {
+                    'Start': pd.to_datetime(t_start),
+                    'End': pd.to_datetime(t_end),
+                    'Title': t_title,
+                    'Speaker': t_speaker,
+                    'Location': t_location,
+                    'Notes': t_notes
+                }
+                st.session_state['agenda_df'] = pd.concat([st.session_state['agenda_df'], pd.DataFrame([new_row])], ignore_index=True).sort_values('Start').reset_index(drop=True)
+                st.success('Item añadido a la agenda en la sesión.')
+            except Exception as e:
+                st.error(f'Error al añadir item: {e}')
+
+with col2:
+    st.subheader("📈 Línea de tiempo (Gantt)")
+    chart_df = st.session_state['agenda_df'].copy()
+    # Keep items with valid datetimes
+    chart_df = chart_df.dropna(subset=['Start','End'])
+    if chart_df.empty:
+        st.info('No hay datos con fechas válidas para mostrar en la línea de tiempo.')
+    else:
+        # Prepare for Altair: calculate duration
+        chart_df['start_num'] = chart_df['Start'].astype('int64')//10**9
+        chart_df['end_num'] = chart_df['End'].astype('int64')//10**9
+        chart_df['duration_min'] = (chart_df['end_num'] - chart_df['start_num'])/60
+
+        # Altair Gantt-like chart
+        base = alt.Chart(chart_df).mark_bar().encode(
+            x=alt.X('Start:T', title='Hora'),
+            x2='End:T',
+            y=alt.Y('Title:N', sort=alt.EncodingSortField(field='Start', order='ascending')),
+            color=alt.Color('Speaker:N', legend=alt.Legend(title='Speaker')),
+            tooltip=[alt.Tooltip('Title:N'), alt.Tooltip('Speaker:N'), alt.Tooltip('Start:T'), alt.Tooltip('End:T'), alt.Tooltip('Location:N'), alt.Tooltip('Notes:N')]
+        ).properties(height=400)
+
+        st.altair_chart(base, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Detalles / Expandir item")
+    for idx, row in st.session_state['agenda_df'].sort_values('Start').reset_index(drop=True).iterrows():
+        with st.expander(f"{row['Start']} — {row['Title']} ({row['Speaker']})"):
+            st.write(f"**Inicio:** {row['Start']}")
+            st.write(f"**Fin:** {row['End']}")
+            st.write(f"**Speaker:** {row['Speaker']}")
+            st.write(f"**Location:** {row['Location']}")
+            st.write(f"**Notes:** {row['Notes']}")
+
+# Footer instructions
+st.markdown("---")
+st.write("**Instrucciones para desplegar desde GitHub:**")
+st.write("1. Crea un repositorio en GitHub y sube este archivo como `app.py` en la raíz o en una carpeta.\n2. Si quieres cargar una CSV, sube también `agenda_sample.csv` y copia la url raw (botón 'Raw' en GitHub).\n3. Ve a https://share.streamlit.io y conecta tu repositorio; selecciona el archivo `app.py` y despliega.")
+
+st.write("Si quieres, pega aquí la URL raw de ejemplo de tu archivo CSV en GitHub para que la app lo cargue automáticamente.")
 
